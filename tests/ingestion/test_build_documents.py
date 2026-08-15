@@ -1,3 +1,5 @@
+"""Tests for building corpus documents from arXiv JSON records."""
+
 import json
 import importlib
 import sys
@@ -43,7 +45,14 @@ def _import_build_documents(monkeypatch):
     fake_boto3.client = lambda service_name: fake_client
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
 
-    module = importlib.import_module("src.ingestion.build_documents")
+    for module_name in [
+        "rag.ingestion.build_documents",
+        "rag.ingestion",
+        "rag",
+    ]:
+        sys.modules.pop(module_name, None)
+
+    module = importlib.import_module("rag.ingestion.build_documents")
     return module, fake_client
 
 
@@ -89,7 +98,7 @@ def test_build_documents_from_paper_includes_text_and_metadata(monkeypatch):
 
     documents = build_documents._build_documents_from_paper(paper)
 
-    assert len(documents) == 2
+    assert len(documents) == 3
     assert documents[0].text == "Abstract text"
     assert documents[0].metadata["source_field"] == "abstract"
     assert documents[0].metadata["paper_id"] == "paper-1"
@@ -99,6 +108,10 @@ def test_build_documents_from_paper_includes_text_and_metadata(monkeypatch):
     assert documents[1].metadata["section_id"] == 0
     assert documents[1].metadata["tables"] == {"t1": "|a|b|"}
     assert documents[1].metadata["images"] == {"i1": "base64"}
+
+    assert documents[2].text == "|a|b|"
+    assert documents[2].metadata["source_field"] == "sections.tables"
+    assert documents[2].metadata["table_id"] == "t1"
 
 
 def test_build_all_documents_paginates_s3_results(monkeypatch):
@@ -128,8 +141,14 @@ def test_build_all_documents_paginates_s3_results(monkeypatch):
 
     fake_client.get_object = get_object
 
-    monkeypatch.setattr(build_documents, "_build_documents_from_paper", lambda data: [types.SimpleNamespace(text=data["abstract"])])
+    monkeypatch.setattr(
+        build_documents,
+        "_build_documents_from_paper",
+        lambda data: [types.SimpleNamespace(text=data["abstract"], metadata={})],
+    )
 
     documents = build_documents.build_all_documents()
 
     assert [doc.text for doc in documents] == ["A", "B"]
+    assert documents[0].metadata["source_key"] == "paper-1.json"
+    assert documents[0].metadata["source_hash"]
