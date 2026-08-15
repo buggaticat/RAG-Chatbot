@@ -1,16 +1,26 @@
+"""Format retrieved chunks into a prompt-friendly context block."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from .config import get_tokenizer
+
+if TYPE_CHECKING:
+    from llama_index.core.schema import NodeWithScore
 
 def _lookup_value(node: Any, key: str, default: Any = None) -> Any:
+    """Read a field from either a mapping or an attribute-based object."""
+
     if isinstance(node, dict):
         return node.get(key, default)
     return getattr(node, key, default)
 
 
-def _extract_source_nodes(response_or_chunks: Any) -> list[Any]:
+def _extract_source_nodes(response_or_chunks: Any) -> list[NodeWithScore]:
+    """Normalize a response object or chunk collection into a list of chunks."""
+
     if response_or_chunks is None:
         return []
 
@@ -26,7 +36,9 @@ def _extract_source_nodes(response_or_chunks: Any) -> list[Any]:
     return []
 
 
-def _node_payload(node: Any) -> tuple[str, str, float | None, str, str]:
+def _node_payload(node: NodeWithScore) -> tuple[str, str, float | None, str, str]:
+    """Extract the display payload used to render one chunk in context."""
+
     metadata = _lookup_value(node, "metadata", {}) or {}
     if not isinstance(metadata, dict):
         metadata = {}
@@ -42,28 +54,27 @@ def _node_payload(node: Any) -> tuple[str, str, float | None, str, str]:
     )
     chunk_id = metadata.get("chunk_id") or metadata.get("chunk_index") or _lookup_value(node, "chunk_id") or _lookup_value(node, "chunk_index") or "unknown"
     title = metadata.get("title") or _lookup_value(node, "title") or ""
-    score = None
-
-    if isinstance(node, dict):
-        score = node.get("score")
-    elif hasattr(node, "score"):
-        score = getattr(node, "score")
-    elif hasattr(node, "get_score"):
-        try:
-            score = node.get_score()
-        except Exception:
-            score = None
+    score = node.get("score") if isinstance(node, dict) else getattr(node, "score", None)
+    if score is None:
+        get_score = getattr(node, "get_score", None)
+        if callable(get_score):
+            try:
+                score = get_score()
+            except Exception:
+                score = None
 
     text = _lookup_value(node, "text", "") or _lookup_value(node, "content", "")
     if not text:
-        inner_node = _lookup_value(node, "node")
+        inner_node = node.get("node") if isinstance(node, dict) else getattr(node, "node", None)
         if inner_node is not None:
-            text = _lookup_value(inner_node, "text", "") or _lookup_value(inner_node, "content", "")
+            text = getattr(inner_node, "text", "") or getattr(inner_node, "content", "")
 
-    return str(doc_id), str(chunk_id), score, title or "", text.strip()
+    return str(doc_id), str(chunk_id), score, title or "", str(text).strip()
 
 
 def _estimate_tokens(text: str, tokenizer: Any | None) -> int:
+    """Estimate token usage for a rendered context block."""
+
     if tokenizer is None:
         return len(text.split())
     encoded = tokenizer.encode(text)
@@ -75,6 +86,11 @@ def format_context(
     max_tokens: int | None = None,
     tokenizer: Any | None = None,
 ) -> str:
+    """Render retrieved chunks into a compact, labeled context string."""
+
+    if tokenizer is None:
+        tokenizer = get_tokenizer()
+
     chunks = _extract_source_nodes(response_or_chunks)
     blocks: list[str] = []
     used_tokens = 0

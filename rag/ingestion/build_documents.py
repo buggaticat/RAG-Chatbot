@@ -1,19 +1,16 @@
-import json
-import os
-import re
+"""Build LlamaIndex documents from the Open RAG Bench corpus."""
+
 import hashlib
+import json
+import re
 from typing import Any, Dict, List
 
 import boto3
 from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
 
+from .config import ABSTRACT_SPLITTER, SECTION_SPLITTER, S3_BUCKET_NAME, S3_PREFIX
 
-BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-S3_PREFIX = "open_ragbench/pdf/arxiv/corpus/"
-
-ABSTRACT_SPLITTER = SentenceSplitter(chunk_size=240, chunk_overlap=24)
-SECTION_SPLITTER = SentenceSplitter(chunk_size=280, chunk_overlap=28)
 splitter = SECTION_SPLITTER
 
 
@@ -29,6 +26,8 @@ def _safe_metadata(value: Any) -> Any:
 
 
 def _normalize_text(text: str) -> str:
+    """Normalize line endings and excess blank lines in document text."""
+
     text = re.sub(r"\r\n", "\n", text or "")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -40,6 +39,8 @@ def _chunk_text(
     source_field: str,
     splitter: SentenceSplitter,
 ) -> List[Document]:
+    """Chunk normalized text into LlamaIndex documents with shared metadata."""
+
     normalized = _normalize_text(text)
     if not normalized:
         return []
@@ -64,6 +65,8 @@ def _chunk_text(
 
 
 def _normalize_section_text(section: Dict[str, Any]) -> str:
+    """Combine section title and body text into a single chunking string."""
+
     parts: List[str] = []
 
     section_title = section.get("section_title") or section.get("title")
@@ -78,9 +81,8 @@ def _normalize_section_text(section: Dict[str, Any]) -> str:
 
 
 def _build_documents_from_paper(json_data: Dict[str, Any]) -> List[Document]:
-    """
-    Build retrieval documents from the paper JSON using section-aware chunking.
-    """
+    """Build retrieval documents from a paper JSON payload."""
+
     base_metadata = {
         "paper_id": json_data.get("id"),
         "title": json_data.get("title"),
@@ -93,9 +95,7 @@ def _build_documents_from_paper(json_data: Dict[str, Any]) -> List[Document]:
     documents: List[Document] = []
 
     abstract = json_data.get("abstract", "")
-    documents.extend(
-        _chunk_text(abstract, base_metadata, "abstract", ABSTRACT_SPLITTER)
-    )
+    documents.extend(_chunk_text(abstract, base_metadata, "abstract", ABSTRACT_SPLITTER))
 
     for section in json_data.get("sections", []) or []:
         section_id = section.get("section_id")
@@ -132,10 +132,14 @@ def _build_documents_from_paper(json_data: Dict[str, Any]) -> List[Document]:
 
 
 def hash_json_bytes(raw_bytes: bytes) -> str:
+    """Hash raw JSON bytes so source changes can be tracked deterministically."""
+
     return hashlib.sha256(raw_bytes).hexdigest()
 
 
 def build_all_documents() -> List[Document]:
+    """Load every corpus JSON object from S3 and convert it into documents."""
+
     all_documents: List[Document] = []
 
     continuation_token = None
@@ -143,7 +147,7 @@ def build_all_documents() -> List[Document]:
 
     while True:
         request_kwargs = {
-            "Bucket": BUCKET_NAME,
+            "Bucket": S3_BUCKET_NAME,
             "Prefix": S3_PREFIX,
         }
         if continuation_token:
@@ -153,7 +157,7 @@ def build_all_documents() -> List[Document]:
 
         for obj in response.get("Contents", []):
             key = obj["Key"]
-            file_obj = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+            file_obj = s3.get_object(Bucket=S3_BUCKET_NAME, Key=key)
             raw_bytes = file_obj["Body"].read()
             json_data = json.loads(raw_bytes.decode("utf-8"))
             documents = _build_documents_from_paper(json_data)

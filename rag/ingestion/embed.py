@@ -1,3 +1,5 @@
+"""Create text and image embeddings for the ingested corpus."""
+
 import base64
 import hashlib
 import os
@@ -13,12 +15,21 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from transformers import BlipForConditionalGeneration, BlipProcessor
 
 from .build_documents import build_all_documents
+from .config import (
+    BLIP_MODEL_NAME,
+    EMBEDDING_MODEL_NAME,
+    EMBEDDING_VERSION,
+    NORMALIZE_EMBEDDINGS,
+    PREPROCESSING_HASH_SEED,
+)
 
 @dataclass(frozen=True)
 class EmbeddingConfig:
-    model_name: str = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-3-large")
-    embedding_version: str = os.getenv("EMBEDDING_VERSION", "2026-08-11")
-    normalize: bool = True
+    """Configuration for the embedding pipeline."""
+
+    model_name: str = EMBEDDING_MODEL_NAME
+    embedding_version: str = EMBEDDING_VERSION
+    normalize: bool = NORMALIZE_EMBEDDINGS
 
 
 embedding_config = EmbeddingConfig()
@@ -26,12 +37,8 @@ try:
     embedding_model = OpenAIEmbedding(model=embedding_config.model_name)
 except TypeError:
     embedding_model = OpenAIEmbedding()
-_BLIP_MODEL_NAME = os.getenv(
-    "BLIP_MODEL_NAME", "Salesforce/blip-image-captioning-base"
-)
-
 _PREPROCESSING_HASH = hashlib.sha256(
-    b"normalize_text:v1|section_aware_sentence_splitter:v1|blip_caption:v1"
+    PREPROCESSING_HASH_SEED.encode("utf-8")
 ).hexdigest()
 
 blip_processor = None
@@ -40,6 +47,8 @@ blip_device = None
 
 
 def _normalize_vector(vector: List[float]) -> List[float]:
+    """Optionally L2-normalize an embedding vector."""
+
     if not embedding_config.normalize:
         return vector
 
@@ -51,11 +60,13 @@ def _normalize_vector(vector: List[float]) -> List[float]:
 
 
 def _get_blip_components():
+    """Lazily load the BLIP captioning model and processor."""
+
     global blip_processor, blip_model, blip_device
 
     if blip_processor is None or blip_model is None or blip_device is None:
-        blip_processor = BlipProcessor.from_pretrained(_BLIP_MODEL_NAME)
-        blip_model = BlipForConditionalGeneration.from_pretrained(_BLIP_MODEL_NAME)
+        blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL_NAME)
+        blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL_NAME)
         blip_device = "cuda" if torch.cuda.is_available() else "cpu"
         blip_model.to(blip_device)
 
@@ -63,11 +74,15 @@ def _get_blip_components():
 
 
 def _decode_base64_image(image_data: str) -> Image.Image:
+    """Decode a base64 image string into an RGB PIL image."""
+
     image_bytes = base64.b64decode(image_data)
     return Image.open(BytesIO(image_bytes)).convert("RGB")
 
 
 def _generate_caption(blip_model, processor, device, image):
+    """Generate a short caption for an image using BLIP."""
+
     inputs = processor(image.convert("RGB"), return_tensors="pt").to(device)
 
     with torch.no_grad():
@@ -78,6 +93,8 @@ def _generate_caption(blip_model, processor, device, image):
 
 
 def _embedding_metadata(document_metadata: dict, source_field: str) -> dict:
+    """Attach embedding provenance metadata to a record."""
+
     return {
         **document_metadata,
         "source_field": source_field,
@@ -88,6 +105,8 @@ def _embedding_metadata(document_metadata: dict, source_field: str) -> dict:
     }
 
 def documents_to_embeddings() -> List[Tuple[str, List[float], dict]]:
+    """Convert all documents, tables, and image captions into embeddings."""
+
     all_embedding: List[Tuple[str, List[float], dict]] = []
 
     for document in build_all_documents():
@@ -109,25 +128,7 @@ def documents_to_embeddings() -> List[Tuple[str, List[float], dict]]:
                 )
             )
 
-        if tables:
-            for table_id, table_markdown in tables.items():
-                if not table_markdown:
-                    continue
-                table_embedding = _normalize_vector(
-                    embedding_model.get_text_embedding(table_markdown)
-                )
-                all_embedding.append(
-                    (
-                        table_markdown,
-                        table_embedding,
-                        _embedding_metadata(
-                            {**document.metadata, "table_id": table_id},
-                            "sections.tables",
-                        ),
-                    )
-                )
-
-        if images:
+        if node_metadata.get("source_field") == "sections.text" and images:
             for image_id, image_data in images.items():
                 if not image_data:
                     continue

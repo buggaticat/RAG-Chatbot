@@ -1,18 +1,22 @@
-import os
-import hashlib
+"""Upload embeddings into Qdrant and keep the collection in sync."""
+
 import json
+import hashlib
 from pathlib import Path
 
 from typing import List
 from qdrant_client import QdrantClient, models
 
 from .embed import documents_to_embeddings
-
-QDRANT_APIKEY = os.getenv("QDRANT_APIKEY")
-QDRANT_CLUSTER_ENDPOINT = os.getenv("QDRANT_CLUSTER_ENDPOINT")
-COLLECTION_NAME = "embedding_collection"
-BATCH_SIZE = 64
-INGESTION_STATE_PATH = Path(os.getenv("INGESTION_STATE_PATH", ".ingestion_state.json"))
+from .config import (
+    BATCH_SIZE,
+    COLLECTION_NAME,
+    INGESTION_STATE_PATH,
+    QDRANT_APIKEY,
+    QDRANT_CLUSTER_ENDPOINT,
+    S3_BUCKET_NAME,
+    S3_PREFIX,
+)
 
 client = QdrantClient(
     url=QDRANT_CLUSTER_ENDPOINT,
@@ -20,6 +24,8 @@ client = QdrantClient(
 )
 
 def _ensure_collection(vector_size: int) -> None:
+    """Create the Qdrant collection if it does not already exist."""
+
     existing_collections = {
         collection.name for collection in client.get_collections().collections
     }
@@ -37,16 +43,22 @@ def _ensure_collection(vector_size: int) -> None:
 
 
 def _load_state() -> dict:
+    """Load the ingestion bookkeeping state from disk."""
+
     if not INGESTION_STATE_PATH.exists():
         return {"source_hashes": {}}
     return json.loads(INGESTION_STATE_PATH.read_text(encoding="utf-8"))
 
 
 def _save_state(state: dict) -> None:
+    """Persist the ingestion bookkeeping state to disk."""
+
     INGESTION_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _delete_by_source_key(source_key: str) -> None:
+    """Delete all points previously indexed for a specific source key."""
+
     client.delete(
         collection_name=COLLECTION_NAME,
         points_selector=models.FilterSelector(
@@ -63,16 +75,16 @@ def _delete_by_source_key(source_key: str) -> None:
 
 
 def _list_current_s3_keys() -> set[str]:
+    """List the current S3 keys under the configured corpus prefix."""
+
     import boto3
 
-    bucket_name = os.getenv("S3_BUCKET_NAME")
-    prefix = "open_ragbench/pdf/arxiv/corpus/"
     s3 = boto3.client("s3")
     keys: set[str] = set()
     continuation_token = None
 
     while True:
-        request_kwargs = {"Bucket": bucket_name, "Prefix": prefix}
+        request_kwargs = {"Bucket": S3_BUCKET_NAME, "Prefix": S3_PREFIX}
         if continuation_token:
             request_kwargs["ContinuationToken"] = continuation_token
         response = s3.list_objects_v2(**request_kwargs)
@@ -85,6 +97,8 @@ def _list_current_s3_keys() -> set[str]:
     return keys
 
 def main() -> None:
+    """Sync the current embedding set into Qdrant."""
+
     state = _load_state()
     all_embedding = documents_to_embeddings()
     Point = models.PointStruct

@@ -1,43 +1,12 @@
+"""Construct grounded prompts for arXiv context answering."""
+
 from __future__ import annotations
 
 import json
 from collections.abc import Sequence
 from typing import Any
 
-
-SYSTEM_PROMPT = """You are a careful scientific RAG assistant for arXiv PDF documents.
-Use only the provided context and do not guess beyond the evidence.
-The context may include section text, tables, and image descriptions or placeholders.
-Prefer exact, concise answers grounded in the retrieved material.
-If the answer is not supported by the context, say "Not found in context".
-When the evidence spans multiple chunks, synthesize only what is explicitly supported.
-"""
-
-INSTRUCTIONS = """- Answer the user's question directly and briefly.
-- Treat tables, figure captions, and nearby text as relevant evidence.
-- If the query needs a table or image and the context does not include it, say so.
-- Preserve technical names, numbers, equations, and section-specific details exactly when possible.
-- Return only the answer content needed by the task.
-"""
-
-GROUNDING_TEMPLATE = """You are an enterprise assistant. Use only the context provided below.
-
-System:
-{system_prompt}
-
-Instructions:
-{instructions}
-
-Context:
-{context}
-
-If the requested information is not present in the context, reply exactly:
-"Not found in context"
-
-Return your answer as valid JSON with this schema:
-
-{schema}
-"""
+from .config import GROUNDING_TEMPLATE, INSTRUCTIONS, SYSTEM_PROMPT, get_tokenizer
 
 SCHEMA = json.dumps(
     {
@@ -55,18 +24,24 @@ SCHEMA = json.dumps(
 
 
 def _estimate_tokens(text: str, tokenizer: Any | None) -> int:
+    """Estimate token count for text using either a tokenizer or word split."""
+
     if tokenizer is None:
         return len(text.split())
     return len(tokenizer.encode(text))
 
 
 def _trim_tokens(tokens: Sequence[Any], allowed_tokens: int) -> Sequence[Any]:
+    """Trim a token sequence to the requested maximum length."""
+
     if allowed_tokens <= 0:
         return tokens[:0]
     return tokens[:allowed_tokens]
 
 
 def _render_prompt(system_prompt: str, instructions: str, query: str, context: str) -> str:
+    """Render the full grounded prompt body with the provided context."""
+
     return (
         GROUNDING_TEMPLATE.format(
             system_prompt=system_prompt,
@@ -78,7 +53,19 @@ def _render_prompt(system_prompt: str, instructions: str, query: str, context: s
     )
 
 
-def build_grounded_prompt(system_prompt, instructions, query, context, tokenizer, max_tokens):
+def build_grounded_prompt(
+    system_prompt: str | None,
+    instructions: str | None,
+    query: str,
+    context: str,
+    tokenizer: Any | None,
+    max_tokens: int,
+) -> str:
+    """Build a grounded prompt while trimming context to fit the token budget."""
+
+    if tokenizer is None:
+        tokenizer = get_tokenizer()
+
     if not system_prompt:
         system_prompt = SYSTEM_PROMPT
     if not instructions:
