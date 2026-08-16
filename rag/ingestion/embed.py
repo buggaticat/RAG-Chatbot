@@ -108,6 +108,7 @@ def documents_to_embeddings() -> List[Tuple[str, List[float], dict]]:
     """Convert all documents, tables, and image captions into embeddings."""
 
     all_embedding: List[Tuple[str, List[float], dict]] = []
+    seen_image_keys: set[tuple[str, str, str]] = set()
 
     for document in build_all_documents():
         node_content = document.get_content()
@@ -132,6 +133,14 @@ def documents_to_embeddings() -> List[Tuple[str, List[float], dict]]:
             for image_id, image_data in images.items():
                 if not image_data:
                     continue
+                image_key = (
+                    str(node_metadata.get("paper_id", "")),
+                    str(node_metadata.get("section_id", "")),
+                    str(image_id),
+                )
+                if image_key in seen_image_keys:
+                    continue
+                seen_image_keys.add(image_key)
                 image = _decode_base64_image(image_data)
                 current_model, current_processor, current_device = _get_blip_components()
                 image_caption = _generate_caption(

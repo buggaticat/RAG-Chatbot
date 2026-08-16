@@ -1,9 +1,12 @@
 """Translate user queries into English before retrieval."""
 
-from jigsawstack import JigsawStack
+from __future__ import annotations
+
+from typing import Any
+
 from .config import JIGSAW_APIKEY, TARGET_LANGUAGE
 
-jigsaw = JigsawStack(api_key=JIGSAW_APIKEY)
+jigsaw: Any | None = None
 
 def _extract_translated_text(response) -> str:
     """Normalize the translation response into a plain string."""
@@ -23,14 +26,38 @@ def _extract_translated_text(response) -> str:
 
     return str(response).strip()
 
+
+def _get_jigsaw_client() -> Any | None:
+    """Construct the translation client lazily so import-time failures are avoided."""
+
+    global jigsaw
+
+    if jigsaw is not None:
+        return jigsaw
+
+    try:
+        from jigsawstack import JigsawStack
+    except Exception:
+        return None
+
+    try:
+        jigsaw = JigsawStack(api_key=JIGSAW_APIKEY)
+    except Exception:
+        jigsaw = None
+    return jigsaw
+
 def translate_user_query(user_query: str) -> str:
     """Translate a user query to English using the configured translation service."""
 
     if not user_query:
         return ""
 
+    client = _get_jigsaw_client()
+    if client is None:
+        return user_query
+
     try:
-        response = jigsaw.translate.text({
+        response = client.translate.text({
             "text": user_query,
             "target_language": TARGET_LANGUAGE,
         })

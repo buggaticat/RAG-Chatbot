@@ -7,6 +7,28 @@ from typing import Any, Callable
 from .config import CRITIC_SYSTEM_PROMPT
 
 
+def _parse_json_object(payload: str) -> dict[str, Any]:
+    """Parse a JSON object, tolerating markdown fences or surrounding text."""
+
+    text = payload.strip()
+    if not text:
+        raise ValueError("Critic response is empty.")
+
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            parsed = json.loads(text[start : end + 1])
+        else:
+            raise ValueError("Critic response must be valid JSON.") from None
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Critic response must be a JSON object.")
+    return parsed
+
+
 def build_critic_prompt(context: str, answer_json: Any) -> str:
     """Build the critic prompt from retrieved context and the assistant JSON answer."""
 
@@ -27,10 +49,7 @@ def verify_with_critic(context: str, answer_json: Any, critic_llm: Callable[[str
 
     prompt = build_critic_prompt(context, answer_json)
     resp = critic_llm(prompt)
-    verdict = json.loads(resp)
-
-    if not isinstance(verdict, dict):
-        raise ValueError("Critic response must be a JSON object.")
+    verdict = _parse_json_object(resp)
 
     if "valid" not in verdict:
         raise ValueError("Critic response must include a 'valid' field.")

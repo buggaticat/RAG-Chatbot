@@ -1,5 +1,7 @@
 """Upload embeddings into Qdrant and keep the collection in sync."""
 
+from __future__ import annotations
+
 import json
 import hashlib
 from pathlib import Path
@@ -18,22 +20,34 @@ from .config import (
     S3_PREFIX,
 )
 
-client = QdrantClient(
-    url=QDRANT_CLUSTER_ENDPOINT,
-    api_key=QDRANT_APIKEY
-)
+client: QdrantClient | None = None
+
+
+def _get_client() -> QdrantClient:
+    """Create or reuse the Qdrant client lazily."""
+
+    global client
+
+    if client is None:
+        client = QdrantClient(
+            url=QDRANT_CLUSTER_ENDPOINT,
+            api_key=QDRANT_APIKEY,
+        )
+    return client
 
 def _ensure_collection(vector_size: int) -> None:
     """Create the Qdrant collection if it does not already exist."""
 
+    qdrant_client = _get_client()
+
     existing_collections = {
-        collection.name for collection in client.get_collections().collections
+        collection.name for collection in qdrant_client.get_collections().collections
     }
 
     if COLLECTION_NAME in existing_collections:
         return
 
-    client.create_collection(
+    qdrant_client.create_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=models.VectorParams(
             size=vector_size,
@@ -59,7 +73,7 @@ def _save_state(state: dict) -> None:
 def _delete_by_source_key(source_key: str) -> None:
     """Delete all points previously indexed for a specific source key."""
 
-    client.delete(
+    _get_client().delete(
         collection_name=COLLECTION_NAME,
         points_selector=models.FilterSelector(
             filter=models.Filter(
@@ -102,61 +116,60 @@ def main() -> None:
     state = _load_state()
     all_embedding = documents_to_embeddings()
     Point = models.PointStruct
-
-    if not all_embedding:
-        return
-
-    _ensure_collection(vector_size=len(all_embedding[0][1]))
-
     current_keys = _list_current_s3_keys()
     indexed_hashes = state.get("source_hashes", {})
     current_hashes = {}
 
-    points: List[models.PointStruct] = []
-    for _, embedding, metadata in all_embedding:
-        source_key = metadata.get("source_key")
-        source_hash = metadata.get("source_hash")
-        if source_key and source_key not in current_keys:
-            continue
-        if source_key:
-            current_hashes[source_key] = source_hash
-            if indexed_hashes.get(source_key) == source_hash:
+    qdrant_client = _get_client()
+
+    if all_embedding:
+        _ensure_collection(vector_size=len(all_embedding[0][1]))
+
+        points: List[models.PointStruct] = []
+        for _, embedding, metadata in all_embedding:
+            source_key = metadata.get("source_key")
+            source_hash = metadata.get("source_hash")
+            if source_key and source_key not in current_keys:
                 continue
-            if indexed_hashes.get(source_key) and indexed_hashes.get(source_key) != source_hash:
-                _delete_by_source_key(source_key)
+            if source_key:
+                current_hashes[source_key] = source_hash
+                if indexed_hashes.get(source_key) == source_hash:
+                    continue
+                if indexed_hashes.get(source_key) and indexed_hashes.get(source_key) != source_hash:
+                    _delete_by_source_key(source_key)
 
-        stable_id_source = "|".join(
-            [
-                str(metadata.get("paper_id", "")),
-                str(metadata.get("section_id", "")),
-                str(metadata.get("chunk_index", "")),
-                str(metadata.get("source_field", "")),
-                str(metadata.get("embedding_model", "")),
-                str(metadata.get("embedding_version", "")),
-                str(metadata.get("table_id", "")),
-                str(metadata.get("image_id", "")),
-            ]
-        )
-        stable_id = hashlib.sha256(stable_id_source.encode("utf-8")).hexdigest()
-        point = Point(
-            id=stable_id,
-            vector=embedding,
-            payload=metadata,
-        )
-        points.append(point)
+            stable_id_source = "|".join(
+                [
+                    str(metadata.get("paper_id", "")),
+                    str(metadata.get("section_id", "")),
+                    str(metadata.get("chunk_index", "")),
+                    str(metadata.get("source_field", "")),
+                    str(metadata.get("embedding_model", "")),
+                    str(metadata.get("embedding_version", "")),
+                    str(metadata.get("table_id", "")),
+                    str(metadata.get("image_id", "")),
+                ]
+            )
+            stable_id = hashlib.sha256(stable_id_source.encode("utf-8")).hexdigest()
+            point = Point(
+                id=stable_id,
+                vector=embedding,
+                payload=metadata,
+            )
+            points.append(point)
 
-        if len(points) == BATCH_SIZE:
-            client.upsert(
+            if len(points) == BATCH_SIZE:
+                qdrant_client.upsert(
+                    collection_name=COLLECTION_NAME,
+                    points=points,
+                )
+                points = []
+
+        if points:
+            qdrant_client.upsert(
                 collection_name=COLLECTION_NAME,
                 points=points,
             )
-            points = []
-
-    if points:
-        client.upsert(
-            collection_name=COLLECTION_NAME,
-            points=points,
-        )
 
     deleted_keys = set(indexed_hashes) - current_keys
     for source_key in deleted_keys:
