@@ -3,7 +3,8 @@
 import hashlib
 import json
 import re
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, Iterator, List
 
 import boto3
 from llama_index.core import Document
@@ -12,6 +13,8 @@ from llama_index.core.node_parser import SentenceSplitter
 from .config import ABSTRACT_SPLITTER, SECTION_SPLITTER, S3_BUCKET_NAME, S3_PREFIX
 
 splitter = SECTION_SPLITTER
+S3_READ_RETRIES = 3
+S3_READ_RETRY_DELAY_SECONDS = 1.0
 
 
 def _safe_metadata(value: Any) -> Any:
@@ -137,10 +140,28 @@ def hash_json_bytes(raw_bytes: bytes) -> str:
     return hashlib.sha256(raw_bytes).hexdigest()
 
 
-def build_all_documents() -> List[Document]:
-    """Load every corpus JSON object from S3 and convert it into documents."""
+def _read_s3_object_bytes(s3, key: str) -> bytes:
+    """Read an S3 object with a small retry buffer for transient stream breaks."""
 
-    all_documents: List[Document] = []
+    last_exc: Exception | None = None
+    for attempt in range(1, S3_READ_RETRIES + 1):
+        try:
+            file_obj = s3.get_object(Bucket=S3_BUCKET_NAME, Key=key)
+            return file_obj["Body"].read()
+        except Exception as exc:  # pragma: no cover - network/transient retry path
+            last_exc = exc
+            if attempt < S3_READ_RETRIES:
+                time.sleep(S3_READ_RETRY_DELAY_SECONDS * attempt)
+                continue
+            raise
+
+    if last_exc is not None:  # pragma: no cover - defensive fallback
+        raise last_exc
+    raise RuntimeError(f"Failed to read S3 object: {key}")
+
+
+def iter_all_documents() -> Iterator[Document]:
+    """Stream corpus documents from S3 one object at a time."""
 
     continuation_token = None
     s3 = boto3.client("s3")
@@ -157,8 +178,7 @@ def build_all_documents() -> List[Document]:
 
         for obj in response.get("Contents", []):
             key = obj["Key"]
-            file_obj = s3.get_object(Bucket=S3_BUCKET_NAME, Key=key)
-            raw_bytes = file_obj["Body"].read()
+            raw_bytes = _read_s3_object_bytes(s3, key)
             json_data = json.loads(raw_bytes.decode("utf-8"))
             documents = _build_documents_from_paper(json_data)
             source_hash = hash_json_bytes(raw_bytes)
@@ -168,14 +188,18 @@ def build_all_documents() -> List[Document]:
                     continue
                 metadata["source_key"] = key
                 metadata["source_hash"] = source_hash
-            all_documents.extend(documents)
+                yield document
 
         if not response.get("IsTruncated"):
             break
 
         continuation_token = response.get("NextContinuationToken")
 
-    return all_documents
+
+def build_all_documents() -> List[Document]:
+    """Load every corpus JSON object from S3 and convert it into documents."""
+
+    return list(iter_all_documents())
 
 
 if __name__ == "__main__":

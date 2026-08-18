@@ -4,23 +4,52 @@ from __future__ import annotations
 
 import json
 import hashlib
+import time
+import uuid
 from pathlib import Path
 
 from typing import List
 from qdrant_client import QdrantClient, models
+from tqdm import tqdm
 
-from .embed import documents_to_embeddings
+from eval.embedding_and_index_health import IndexEventLedger
+
+from .embed import (
+    _clear_checkpoint,
+    _load_checkpoint,
+    _save_progress_checkpoint,
+    get_checkpoint_embeddings,
+    iter_document_embedding_batches,
+)
 from .config import (
     BATCH_SIZE,
     COLLECTION_NAME,
     INGESTION_STATE_PATH,
     QDRANT_APIKEY,
     QDRANT_CLUSTER_ENDPOINT,
+    QDRANT_REQUEST_TIMEOUT_SECONDS,
+    QDRANT_UPSERT_BATCH_SIZE,
+    QDRANT_UPSERT_MAX_RETRIES,
+    QDRANT_UPSERT_RETRY_BACKOFF_SECONDS,
     S3_BUCKET_NAME,
     S3_PREFIX,
 )
 
 client: QdrantClient | None = None
+index_event_ledger = IndexEventLedger()
+
+
+def _record_index_event(stage: str, success: bool, exc: Exception | None = None, metadata: dict | None = None) -> None:
+    """Persist a structured index event for health evaluation."""
+
+    index_event_ledger.record_event(
+        "qdrant_ingestion",
+        success=success,
+        stage=stage,
+        message=str(exc) if exc else None,
+        error_type=exc.__class__.__name__ if exc else None,
+        metadata=metadata or {},
+    )
 
 
 def _get_client() -> QdrantClient:
@@ -32,8 +61,136 @@ def _get_client() -> QdrantClient:
         client = QdrantClient(
             url=QDRANT_CLUSTER_ENDPOINT,
             api_key=QDRANT_APIKEY,
+            timeout=QDRANT_REQUEST_TIMEOUT_SECONDS,
         )
     return client
+
+
+def _log(message: str) -> None:
+    """Print a simple ingestion progress message."""
+
+    print(f"[qdrant-ingestion] {message}")
+
+
+def _chunked(items, size: int):
+    """Yield fixed-size slices from an in-memory sequence."""
+
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def _is_retryable_qdrant_error(exc: Exception) -> bool:
+    """Detect timeout-style failures that are worth retrying."""
+
+    name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    if "timeout" in name:
+        return True
+    return "timed out" in message or "timeout" in message
+
+
+def _upsert_points(points: list[models.PointStruct], *, batch_label: str) -> None:
+    """Upsert a set of points into Qdrant with retries and smaller transport batches."""
+
+    qdrant_client = _get_client()
+    total_batches = list(_chunked(points, max(1, QDRANT_UPSERT_BATCH_SIZE)))
+    for batch_index, batch_points in enumerate(total_batches, start=1):
+        attempt = 0
+        while True:
+            try:
+                _log(
+                    f"Uploading {batch_label} sub-batch {batch_index}/{len(total_batches)} "
+                    f"with {len(batch_points)} vector(s)"
+                )
+                qdrant_client.upsert(
+                    collection_name=COLLECTION_NAME,
+                    points=batch_points,
+                )
+                _log(f"{batch_label.capitalize()} sub-batch {batch_index} uploaded successfully")
+                break
+            except Exception as exc:
+                attempt += 1
+                if attempt >= max(1, QDRANT_UPSERT_MAX_RETRIES) or not _is_retryable_qdrant_error(exc):
+                    raise
+                delay_s = QDRANT_UPSERT_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                _log(
+                    f"{batch_label.capitalize()} sub-batch {batch_index} hit a timeout "
+                    f"({attempt}/{QDRANT_UPSERT_MAX_RETRIES}); retrying in {delay_s:.1f}s"
+                )
+                time.sleep(delay_s)
+
+
+def _prepare_points(
+    embeddings,
+    *,
+    current_keys: set[str],
+    indexed_hashes: dict[str, str],
+    current_hashes: dict[str, str],
+    deleted_source_keys: set[str],
+):
+    """Convert embeddings into Qdrant points while applying sync filters."""
+
+    points: List[models.PointStruct] = []
+    skipped_unchanged = 0
+    skipped_missing_source = 0
+    deleted_replaced = 0
+    processed_embeddings = 0
+
+    for _, embedding, metadata in embeddings:
+        processed_embeddings += 1
+        source_key = metadata.get("source_key")
+        source_hash = metadata.get("source_hash")
+        if source_key and source_key not in current_keys:
+            skipped_missing_source += 1
+            continue
+        if source_key:
+            current_hashes[source_key] = source_hash
+            if indexed_hashes.get(source_key) == source_hash:
+                skipped_unchanged += 1
+                continue
+            if (
+                indexed_hashes.get(source_key)
+                and indexed_hashes.get(source_key) != source_hash
+                and source_key not in deleted_source_keys
+            ):
+                deleted_replaced += 1
+                _delete_by_source_key(source_key)
+                deleted_source_keys.add(source_key)
+
+        stable_id_source = "|".join(
+            [
+                str(metadata.get("paper_id", "")),
+                str(metadata.get("section_id", "")),
+                str(metadata.get("chunk_index", "")),
+                str(metadata.get("source_field", "")),
+                str(metadata.get("embedding_model", "")),
+                str(metadata.get("embedding_version", "")),
+                str(metadata.get("table_id", "")),
+                str(metadata.get("image_id", "")),
+            ]
+        )
+        stable_id = str(uuid.uuid5(uuid.NAMESPACE_URL, stable_id_source))
+        points.append(
+            models.PointStruct(
+                id=stable_id,
+                vector=embedding,
+                payload=metadata,
+            )
+        )
+
+    return points, {
+        "processed_embeddings": processed_embeddings,
+        "skipped_unchanged": skipped_unchanged,
+        "skipped_missing_source": skipped_missing_source,
+        "deleted_replaced": deleted_replaced,
+    }
+
+
+def _point_vector_size(point) -> int:
+    """Return the vector width for either a real Qdrant point or a test double."""
+
+    vector = point["vector"] if isinstance(point, dict) else point.vector
+    return len(vector)
 
 def _ensure_collection(vector_size: int) -> None:
     """Create the Qdrant collection if it does not already exist."""
@@ -113,72 +270,130 @@ def _list_current_s3_keys() -> set[str]:
 def main() -> None:
     """Sync the current embedding set into Qdrant."""
 
-    state = _load_state()
-    all_embedding = documents_to_embeddings()
-    Point = models.PointStruct
-    current_keys = _list_current_s3_keys()
-    indexed_hashes = state.get("source_hashes", {})
-    current_hashes = {}
+    try:
+        _log(f"Starting sync into collection '{COLLECTION_NAME}'")
+        _log("Loading ingestion state")
+        state = _load_state()
+        _log("Listing current S3 keys")
+        current_keys = _list_current_s3_keys()
+        _log(f"Found {len(current_keys)} S3 objects under prefix '{S3_PREFIX}'")
+        indexed_hashes = state.get("source_hashes", {})
+        current_hashes = {}
+        upserted_points = 0
 
-    qdrant_client = _get_client()
+        _log("Connecting to Qdrant")
+        qdrant_client = _get_client()
 
-    if all_embedding:
-        _ensure_collection(vector_size=len(all_embedding[0][1]))
+        checkpoint = _load_checkpoint()
+        checkpoint_embeddings = get_checkpoint_embeddings(checkpoint)
+        next_task_index = int(checkpoint.get("next_task_index", 0) or 0)
+        collection_ready = False
+        batch_number = 0
+        deleted_source_keys: set[str] = set()
 
-        points: List[models.PointStruct] = []
-        for _, embedding, metadata in all_embedding:
-            source_key = metadata.get("source_key")
-            source_hash = metadata.get("source_hash")
-            if source_key and source_key not in current_keys:
-                continue
-            if source_key:
-                current_hashes[source_key] = source_hash
-                if indexed_hashes.get(source_key) == source_hash:
-                    continue
-                if indexed_hashes.get(source_key) and indexed_hashes.get(source_key) != source_hash:
-                    _delete_by_source_key(source_key)
+        def commit_state() -> None:
+            indexed_hashes.update(current_hashes)
+            state["source_hashes"] = indexed_hashes
+            _save_state(state)
 
-            stable_id_source = "|".join(
-                [
-                    str(metadata.get("paper_id", "")),
-                    str(metadata.get("section_id", "")),
-                    str(metadata.get("chunk_index", "")),
-                    str(metadata.get("source_field", "")),
-                    str(metadata.get("embedding_model", "")),
-                    str(metadata.get("embedding_version", "")),
-                    str(metadata.get("table_id", "")),
-                    str(metadata.get("image_id", "")),
-                ]
+        if checkpoint_embeddings:
+            _log(
+                f"Draining {len(checkpoint_embeddings)} saved embedding(s) "
+                "from the local checkpoint"
             )
-            stable_id = hashlib.sha256(stable_id_source.encode("utf-8")).hexdigest()
-            point = Point(
-                id=stable_id,
-                vector=embedding,
-                payload=metadata,
-            )
-            points.append(point)
-
-            if len(points) == BATCH_SIZE:
-                qdrant_client.upsert(
-                    collection_name=COLLECTION_NAME,
-                    points=points,
+            for batch in _chunked(checkpoint_embeddings, BATCH_SIZE):
+                points, stats = _prepare_points(
+                    batch,
+                    current_keys=current_keys,
+                    indexed_hashes=indexed_hashes,
+                    current_hashes=current_hashes,
+                    deleted_source_keys=deleted_source_keys,
                 )
-                points = []
+                if points:
+                    if not collection_ready:
+                        _ensure_collection(vector_size=_point_vector_size(points[0]))
+                        collection_ready = True
+                    batch_number += 1
+                    _log(
+                        f"Uploading checkpoint batch {batch_number} with {len(points)} vector(s) "
+                        f"after processing {stats['processed_embeddings']} embedding(s)"
+                    )
+                _upsert_points(points, batch_label=f"checkpoint batch {batch_number}")
+                upserted_points += len(points)
+            commit_state()
+            _save_progress_checkpoint(next_task_index)
+        else:
+            _log("No saved embeddings were found in the local checkpoint")
 
-        if points:
-            qdrant_client.upsert(
-                collection_name=COLLECTION_NAME,
-                points=points,
+        _log("Streaming new embedding batches from the corpus")
+        streamed_embeddings = 0
+        skipped_unchanged = 0
+        skipped_missing_source = 0
+        deleted_replaced = 0
+
+        for batch_next_index, batch_records in iter_document_embedding_batches(checkpoint):
+            streamed_embeddings += len(batch_records)
+            points, stats = _prepare_points(
+                batch_records,
+                current_keys=current_keys,
+                indexed_hashes=indexed_hashes,
+                current_hashes=current_hashes,
+                deleted_source_keys=deleted_source_keys,
+            )
+            skipped_unchanged += stats["skipped_unchanged"]
+            skipped_missing_source += stats["skipped_missing_source"]
+            deleted_replaced += stats["deleted_replaced"]
+
+            if points:
+                if not collection_ready:
+                    _ensure_collection(vector_size=_point_vector_size(points[0]))
+                    collection_ready = True
+                batch_number += 1
+                _log(
+                    f"Uploading streamed batch {batch_number} with {len(points)} vector(s) "
+                    f"after embedding cursor {batch_next_index}"
+                )
+                _upsert_points(points, batch_label=f"streamed batch {batch_number}")
+                upserted_points += len(points)
+            commit_state()
+            _save_progress_checkpoint(batch_next_index)
+
+        if not collection_ready:
+            _log("No embeddings were produced, skipping collection creation and upsert")
+        else:
+            _log(
+                "Upsert complete "
+                f"(inserted {upserted_points} points, "
+                f"skipped {skipped_unchanged} unchanged, "
+                f"skipped {skipped_missing_source} missing-source, "
+                f"replaced {deleted_replaced} stale source sets)"
             )
 
-    deleted_keys = set(indexed_hashes) - current_keys
-    for source_key in deleted_keys:
-        _delete_by_source_key(source_key)
-        indexed_hashes.pop(source_key, None)
+        deleted_keys = set(indexed_hashes) - current_keys
+        if deleted_keys:
+            _log(f"Deleting {len(deleted_keys)} stale source key(s) from Qdrant")
+        for source_key in deleted_keys:
+            _delete_by_source_key(source_key)
+            indexed_hashes.pop(source_key, None)
 
-    indexed_hashes.update(current_hashes)
-    state["source_hashes"] = indexed_hashes
-    _save_state(state)
+        indexed_hashes.update(current_hashes)
+        _log("Saving ingestion state")
+        state["source_hashes"] = indexed_hashes
+        _save_state(state)
+        _clear_checkpoint()
+        _log(
+            "Summary: "
+            f"{len(current_keys)} source object(s) scanned, "
+            f"{streamed_embeddings + len(checkpoint_embeddings)} embedding(s) produced, "
+            f"{upserted_points} vector(s) uploaded"
+        )
+        _log("Sync finished successfully")
+    except Exception as exc:
+        _log(f"Sync failed: {exc}")
+        _record_index_event("sync", False, exc, {"collection_name": COLLECTION_NAME})
+        raise
+    else:
+        _record_index_event("sync", True, metadata={"collection_name": COLLECTION_NAME})
 
 
 if __name__ == "__main__":

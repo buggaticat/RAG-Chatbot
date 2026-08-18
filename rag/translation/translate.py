@@ -35,6 +35,9 @@ def _get_jigsaw_client() -> Any | None:
     if jigsaw is not None:
         return jigsaw
 
+    if not JIGSAW_APIKEY:
+        return None
+
     try:
         from jigsawstack import JigsawStack
     except Exception:
@@ -45,6 +48,7 @@ def _get_jigsaw_client() -> Any | None:
     except Exception:
         jigsaw = None
     return jigsaw
+
 
 def translate_user_query(user_query: str) -> str:
     """Translate a user query to English using the configured translation service."""
@@ -65,4 +69,3 @@ def translate_user_query(user_query: str) -> str:
         return translated or user_query
     except Exception:
         return user_query
-    
