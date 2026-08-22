@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,6 +11,7 @@ from langgraph.graph import END, StateGraph
 from rag.context_assembly import INSTRUCTIONS, SYSTEM_PROMPT, build_grounded_prompt, format_context
 from rag.retrieval.config import DEFAULT_RERANK_MODEL
 from rag.validation_layers import DeterministicValidationResult, validate_deterministic_output, verify_with_critic
+from eval import LatencyRecorder
 
 from .prompt import NormalizedQuery, decompose_rewritten_query, normalize_query_language, rewrite_user_query
 from .state import ChatbotRunResult, ChatbotState, SubQuestionResult, SubQuestionState
@@ -39,9 +41,12 @@ class RAGChatbotGraph:
         rerank_top_n: int | None = None,
         rerank_model: str = DEFAULT_RERANK_MODEL,
         context_max_tokens: int | None = None,
-        max_context_retries: int = 1,
-        max_retrieval_rounds: int = 2,
+        max_subquestions: int = 3,
+        max_context_retries: int = 2,
+        max_retrieval_rounds: int = 1,
         system_prompt: str = SYSTEM_PROMPT,
+        status_callback: Any | None = None,
+        latency_recorder: LatencyRecorder | None = None,
     ) -> None:
         self.answer_model = answer_model
         self.critic_model = critic_model
@@ -53,9 +58,13 @@ class RAGChatbotGraph:
         self.rerank_top_n = rerank_top_n
         self.rerank_model = rerank_model
         self.context_max_tokens = context_max_tokens
+        self.max_subquestions = max(1, max_subquestions)
         self.max_context_retries = max_context_retries
         self.max_retrieval_rounds = max_retrieval_rounds
         self.system_prompt = system_prompt
+        self.status_callback = status_callback
+        self.latency_recorder = latency_recorder
+        self._component_timings: list[dict[str, Any]] = []
 
         self.subquestion_graph = self._build_subquestion_graph()
         self.graph = self._build_chatbot_graph()
@@ -77,6 +86,29 @@ class RAGChatbotGraph:
 
         return format_context(retrieved, max_tokens=self.context_max_tokens)
 
+    def _emit_status(self, message: str) -> None:
+        """Send a lightweight progress message to the configured terminal hook."""
+
+        callback = self.status_callback
+        if callback is None:
+            return
+        try:
+            callback(message)
+        except Exception:
+            return
+
+    def _record_component_timing(self, component: str, started_at: float) -> None:
+        """Record component timing when a latency recorder is configured."""
+
+        duration_s = time.perf_counter() - started_at
+        self._component_timings.append({"component": component, "duration_s": duration_s})
+        if self.latency_recorder is None:
+            return
+        try:
+            self.latency_recorder.record_component(component, duration_s)
+        except Exception:
+            return
+
     def _build_answer_prompt(self, query: str, context: str, *, strict: bool = False) -> str:
         """Build the grounded answer prompt for a specific sub-question."""
 
@@ -87,7 +119,7 @@ class RAGChatbotGraph:
             query,
             context,
             tokenizer=None,
-            max_tokens=self.context_max_tokens or 4096,
+            max_tokens=self.context_max_tokens or 1024,
         )
 
     def _retrieve(self, query: str) -> Any:
@@ -243,6 +275,8 @@ class RAGChatbotGraph:
         if verdict.get("valid") is True:
             return "end"
         if verdict.get("missing_context"):
+            if state.get("context_retry_count", 0) < self.max_context_retries:
+                return "retry_context"
             return "end"
         if state.get("context_retry_count", 0) < self.max_context_retries and verdict.get("unsupported_claims"):
             return "retry_context"
@@ -265,7 +299,10 @@ class RAGChatbotGraph:
         """Retrieve candidate chunks for one sub-question."""
 
         query = normalize_text(state.get("retrieval_query") or state.get("subquestion") or "")
+        self._emit_status(f"Retrieving chunks for: {query or 'sub-question'}...")
+        started_at = time.perf_counter()
         retrieved = self._retrieve(query)
+        self._record_component_timing("vector_search", started_at)
         return {
             "retrieval_query": query,
             "retrieval_response": retrieved,
@@ -277,7 +314,10 @@ class RAGChatbotGraph:
 
         query = normalize_text(state.get("retrieval_query") or state.get("subquestion") or "")
         retrieved = state.get("retrieval_response")
+        self._emit_status("Reranking retrieved chunks...")
+        started_at = time.perf_counter()
         reranked = self._rerank_retrieved(query, retrieved)
+        self._record_component_timing("reranker", started_at)
         return {
             "reranked_response": reranked,
             "notes": copy_notes(state.get("notes")),
@@ -287,12 +327,15 @@ class RAGChatbotGraph:
         """Assemble a grounded context block and answer prompt."""
 
         source = state.get("reranked_response") or state.get("retrieval_response")
+        self._emit_status("Assembling grounded context...")
+        started_at = time.perf_counter()
         context = self._build_context(source)
         prompt = self._build_answer_prompt(
             state.get("subquestion", ""),
             context,
             strict=bool(state.get("strict_context")),
         )
+        self._record_component_timing("prompt_assembly", started_at)
         return {
             "context": context,
             "prompt": prompt,
@@ -303,7 +346,10 @@ class RAGChatbotGraph:
         """Call the answer model using the assembled prompt."""
 
         prompt = state.get("prompt", "")
+        self._emit_status("Generating answer...")
+        started_at = time.perf_counter()
         answer_raw = self._ask_answer_model(prompt)
+        self._record_component_timing("answer_model", started_at)
         return {
             "answer_raw": answer_raw,
             "notes": copy_notes(state.get("notes")),
@@ -313,7 +359,10 @@ class RAGChatbotGraph:
         """Run deterministic grounding checks on the answer."""
 
         response = state.get("reranked_response") or state.get("retrieval_response")
+        self._emit_status("Running deterministic validation layer...")
+        started_at = time.perf_counter()
         deterministic_result = validate_deterministic_output(state.get("answer_raw"), response)
+        self._record_component_timing("deterministic_validation", started_at)
         notes = copy_notes(state.get("notes"))
         notes.extend(deterministic_result.errors)
 
@@ -363,9 +412,12 @@ class RAGChatbotGraph:
         context = state.get("context", "")
         answer_payload = parse_answer_payload(state.get("answer_raw")) or state.get("answer_raw")
         notes = copy_notes(state.get("notes"))
+        self._emit_status("Running critic verification...")
 
         try:
+            started_at = time.perf_counter()
             verdict = verify_with_critic(context, answer_payload, lambda prompt: invoke_text_model(self.critic_model, prompt))
+            self._record_component_timing("critic_model", started_at)
         except Exception as exc:
             verdict = {
                 "valid": False,
@@ -457,12 +509,14 @@ class RAGChatbotGraph:
     def _graph_normalize_language(self, state: ChatbotState) -> ChatbotState:
         """Translate the user query into the working language."""
 
+        self._emit_status("Normalizing query language...")
         normalized_query = self._normalize_query(state.get("original_query", ""))
         return {"normalized_query": normalized_query}
 
     def _graph_rewrite_query(self, state: ChatbotState) -> ChatbotState:
         """Rewrite the normalized query into a retrieval-friendly query."""
 
+        self._emit_status("Rewriting query for retrieval...")
         normalized_query = state.get("normalized_query") or self._normalize_query(state.get("original_query", ""))
         rewritten_query = rewrite_user_query(
             normalized_query.normalized,
@@ -477,16 +531,18 @@ class RAGChatbotGraph:
     def _graph_decompose_query(self, state: ChatbotState) -> ChatbotState:
         """Break the rewritten query into smaller retrieval objectives."""
 
+        self._emit_status("Decomposing query into sub-questions...")
         rewritten_query = normalize_text(state.get("rewritten_query", ""))
         subquestions = decompose_rewritten_query(
             rewritten_query,
             model=self.decomposition_model,
             feedback=state.get("rewrite_feedback"),
+            max_subquestions=self.max_subquestions,
         )
         if not subquestions:
             fallback = rewritten_query or (state.get("normalized_query").normalized if state.get("normalized_query") else "")
             subquestions = [fallback] if fallback else []
-        return {"subquestions": subquestions}
+        return {"subquestions": subquestions[: self.max_subquestions]}
 
     def _run_subquestion_graph(self, subquestion: str, *, retrieval_query: str, retried_retrieval: bool) -> SubQuestionResult:
         """Execute the per-subquestion LangGraph and return the structured trace."""
@@ -550,6 +606,7 @@ class RAGChatbotGraph:
                 continue
             seen_keys.add(key)
             ordered_keys.append(key)
+            self._emit_status(f"Processing sub-question: {subquestion or retrieval_query}...")
 
             previous_result = previous_by_key.get(key)
             if previous_result and previous_result.accepted:
@@ -602,6 +659,7 @@ class RAGChatbotGraph:
     ) -> ChatbotRunResult:
         """Run the full chatbot graph for a single user prompt."""
 
+        self._component_timings = []
         result_state = self.graph.invoke(
             {
                 "original_query": user_prompt,
@@ -627,6 +685,7 @@ class RAGChatbotGraph:
             accepted=bool(result_state.get("accepted")) and bool(subquestion_results),
             retry_count=int(result_state.get("retry_count", 0)),
             feedback=result_state.get("rewrite_feedback"),
+            component_timings=list(self._component_timings),
         )
 
     def _assemble_final_answer(self, subquestion_results: list[SubQuestionResult]) -> str:
@@ -646,6 +705,3 @@ class RAGChatbotGraph:
         if len(answers) == 1:
             return answers[0]
         return "\n".join(f"- {answer}" for answer in answers)
-
-
-

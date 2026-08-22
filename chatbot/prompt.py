@@ -57,10 +57,14 @@ Optional retrieval feedback:
 {feedback}
 """
 
-_DECOMPOSE_SYSTEM_PROMPT = """You split a retrieval query into smaller independent sub-questions.
+_DECOMPOSE_SYSTEM_PROMPT = """You split a retrieval query into smaller independent sub-questions only when decomposition is necessary.
+If the question can be answered directly without splitting, do not decompose it.
+Only decompose when the query clearly has multiple parts/questions, or when answering the final question requires first answering another question.
 Each item should be answerable on its own and should not depend on another item's answer.
 Prefer concise objectives that help retrieval.
 Return JSON with a single key named "subquestions" whose value is a list of strings.
+Return at most 3 subquestions.
+If no decomposition is needed, return an empty list.
 """
 
 _DECOMPOSE_HUMAN_PROMPT = """Break this rewritten query into smaller, independent sub-questions or objectives.
@@ -172,7 +176,7 @@ def decompose_rewritten_query(
     *,
     model: Any | None = None,
     feedback: str | None = None,
-    max_subquestions: int = 6,
+    max_subquestions: int = 3,
 ) -> list[str]:
     """Break a rewritten query into smaller independent sub-questions."""
 

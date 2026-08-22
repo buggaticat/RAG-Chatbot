@@ -43,6 +43,7 @@ class ChatbotRunResult:
     accepted: bool
     retry_count: int = 0
     feedback: str | None = None
+    component_timings: list[dict[str, Any]] = field(default_factory=list)
 
 
 class SubQuestionState(TypedDict, total=False):
@@ -83,3 +84,4 @@ class ChatbotState(TypedDict, total=False):
     accepted: bool
     retry_count: int
     needs_rewrite_retry: bool
+    component_timings: list[dict[str, Any]]
