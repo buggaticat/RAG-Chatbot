@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover - optional dependency
     LLMContextPrecisionWithReference = None
     LLMContextRecall = None
     Faithfulness = None
-ResponseGroundedness = None
+    ResponseGroundedness = None
 
 
 def _score_value(result: Any) -> float:
@@ -92,7 +92,7 @@ def _run_coroutine(coro: Any) -> Any:
     """Run an async coroutine from synchronous code."""
 
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
     raise RuntimeError("evaluate() cannot be called from a running event loop; use evaluate_async().")
@@ -179,6 +179,8 @@ class RetrievalAndAnswerQualityReport:
             "response_groundedness": _metric_to_dict(self.response_groundedness),
             "hallucination_rate": self.hallucination_rate,
         }
+
+
 class RetrievalAndAnswerQualityEvaluator:
     """Evaluate retrieval and grounding metrics with optional Ragas objects."""
 

@@ -117,6 +117,38 @@ class EmbeddingSnapshot:
                 return cls.from_payload(candidate, label=key)
         return None
 
+    @classmethod
+    def load_current_from_file(cls, path: str | Path = DEFAULT_EMBEDDING_DRIFT_PATH) -> "EmbeddingSnapshot | None":
+        """Load the most recent current snapshot from disk when the live checkpoint is gone."""
+
+        file_path = Path(path)
+        if not file_path.exists():
+            return None
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None
+
+        candidate = payload.get("current")
+        if isinstance(candidate, dict) and candidate:
+            return cls.from_payload(candidate, label="current")
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Render the snapshot as JSON-safe data."""
+
+        return {
+            "count": self.count,
+            "mean_norm": self.mean_norm,
+            "std_norm": self.std_norm,
+            "median_norm": self.median_norm,
+            "p95_norm": self.p95_norm,
+            "min_norm": self.min_norm,
+            "max_norm": self.max_norm,
+            "centroid": self.centroid,
+            "label": self.label,
+            "generated_at": self.generated_at.isoformat(),
+        }
+
 
 @dataclass
 class EmbeddingDriftReport:
