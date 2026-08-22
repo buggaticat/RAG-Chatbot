@@ -16,16 +16,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Changes to these files are broad enough that we should run the full suite.
-FULL_SUITE_FILES = {
-    "load_data.py",
-    "requirements.txt",
-    "pyproject.toml",
-    "setup.py",
-    "setup.cfg",
-    "tox.ini",
-}
-FULL_SUITE_PREFIXES = (".github/",)
 APP_PREFIXES = ("chatbot/", "cli/", "eval/", "rag/")
 
 # Known source-to-test mappings for this repository.
@@ -92,6 +82,8 @@ def map_source_file(path: Path) -> Path | None:
         return Path("tests/chatbot/test_workflow.py")
     if path_str in {"chatbot/utils.py", "chatbot/state.py"}:
         return Path("tests/chatbot")
+    if path_str.startswith("cli/") and path.suffix == ".py":
+        return Path("tests/cli")
 
     for prefix, test_dir in PACKAGE_TEST_DIRS:
         if path_str.startswith(prefix) and path.suffix == ".py":
@@ -113,20 +105,16 @@ def select_targets(files: list[Path]) -> str:
     for path in files:
         path_str = path.as_posix()
 
-        if path_str in FULL_SUITE_FILES or path_str.startswith(FULL_SUITE_PREFIXES):
-            run_all = True
-            continue
-
         if path.name == "__init__.py":
             continue
 
         if path_str.startswith("tests/"):
             continue
 
-        if path.suffix == ".py":
-            if not path_str.startswith(APP_PREFIXES):
-                continue
+        if not path_str.startswith(APP_PREFIXES):
+            continue
 
+        if path.suffix == ".py":
             mapped = map_source_file(path)
             if mapped is None:
                 run_all = True
