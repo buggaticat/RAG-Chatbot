@@ -1,0 +1,81 @@
+#!/usr/bin/env sh
+set -eu
+
+REMOTE_NAME="$1"
+REMOTE_URL="$2"
+ZERO_SHA="0000000000000000000000000000000000000000"
+ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+PYTEST_BASETEMP="$ROOT_DIR/.pytest-tmp.$$"
+
+cd "$ROOT_DIR"
+
+TARGETS_FILE="$(mktemp)"
+trap 'rm -f "$TARGETS_FILE"; rm -rf "$PYTEST_BASETEMP"' EXIT
+
+mkdir -p "$PYTEST_BASETEMP"
+
+RUN_ALL=0
+
+while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
+  [ -n "${LOCAL_REF:-}" ] || continue
+
+  if [ "$LOCAL_SHA" = "$ZERO_SHA" ]; then
+    continue
+  fi
+
+  if [ "$REMOTE_SHA" = "$ZERO_SHA" ]; then
+    RUN_ALL=1
+    continue
+  fi
+
+  SELECTED="$(python .github/scripts/select_tests.py --base "$REMOTE_SHA" --head "$LOCAL_SHA" | tr -d '\r')"
+
+  if [ "$SELECTED" = "ALL" ]; then
+    RUN_ALL=1
+    continue
+  fi
+
+  if [ -n "$SELECTED" ]; then
+    printf '%s\n' "$SELECTED" >> "$TARGETS_FILE"
+  fi
+done
+
+if [ "$RUN_ALL" -eq 1 ]; then
+  echo "pre-push: running full test suite before pushing to $REMOTE_NAME ($REMOTE_URL)"
+  if ! python -c "import pytest" >/dev/null 2>&1; then
+    echo "pre-push: pytest is not installed in the active Python environment."
+    echo "pre-push: run 'python -m pip install -r requirements.txt' and try again."
+    exit 1
+  fi
+
+  if ! python -m pytest -q -p no:cacheprovider --basetemp="$PYTEST_BASETEMP"; then
+    echo "pre-push: push blocked because the full test suite failed."
+    exit 1
+  fi
+
+  exit 0
+fi
+
+if [ ! -s "$TARGETS_FILE" ]; then
+  echo "pre-push: no relevant Python changes detected; skipping tests."
+  exit 0
+fi
+
+echo "pre-push: running targeted tests before pushing to $REMOTE_NAME ($REMOTE_URL)"
+sort -u "$TARGETS_FILE" > "${TARGETS_FILE}.dedup"
+mv "${TARGETS_FILE}.dedup" "$TARGETS_FILE"
+cat "$TARGETS_FILE"
+
+if ! python -c "import pytest" >/dev/null 2>&1; then
+  echo "pre-push: pytest is not installed in the active Python environment."
+  echo "pre-push: run 'python -m pip install -r requirements.txt' and try again."
+  exit 1
+fi
+
+PYTEST_TARGETS="$(tr -d '\r' < "$TARGETS_FILE" | tr '\n' ' ')"
+set -- $PYTEST_TARGETS
+
+if ! python -m pytest -q -p no:cacheprovider --basetemp="$PYTEST_BASETEMP" "$@"; then
+  echo "pre-push: push blocked because targeted tests failed."
+  exit 1
+fi
