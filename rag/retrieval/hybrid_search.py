@@ -3,20 +3,36 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import Any
 
 from qdrant_client import QdrantClient
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.core.postprocessor import SentenceTransformerRerank
-from llama_index.core import StorageContext, VectorStoreIndex
+from llama_index.core import VectorStoreIndex
 from .config import (
     COLLECTION_NAME,
     DEFAULT_RERANK_MODEL,
     DEFAULT_TOP_K,
-    FASTEMBED_SPARSE_MODEL,
+    EMBEDDING_MODEL_NAME,
+    LLM_MODEL_NAME,
     QDRANT_APIKEY,
     QDRANT_CLUSTER_ENDPOINT,
 )
+
+
+def _build_llm() -> Any:
+    """Create the LLM used by the query engine when the dependency is available."""
+
+    try:
+        from llama_index.llms.openai import OpenAI as LlamaIndexOpenAI
+    except Exception:
+        return None
+
+    try:
+        return LlamaIndexOpenAI(model=LLM_MODEL_NAME)
+    except TypeError:
+        return LlamaIndexOpenAI()
 
 
 SEARCHABLE_METADATA_KEYS: tuple[str, ...] = (
@@ -115,6 +131,54 @@ def _apply_metadata_filters(
     return [document for document in documents if _document_matches_filters(document, metadata_filters)]
 
 
+def _build_embed_model() -> Any:
+    """Create the dense query embedder used by retrieval."""
+
+    from llama_index.embeddings.openai import OpenAIEmbedding
+
+    try:
+        return OpenAIEmbedding(model=EMBEDDING_MODEL_NAME)
+    except TypeError:
+        return OpenAIEmbedding()
+
+
+@lru_cache(maxsize=1)
+def _get_qdrant_client() -> QdrantClient:
+    """Build and cache the Qdrant client used for retrieval."""
+
+    return QdrantClient(
+        url=QDRANT_CLUSTER_ENDPOINT,
+        api_key=QDRANT_APIKEY,
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_embed_model() -> Any:
+    """Build and cache the query embedder used by retrieval."""
+
+    return _build_embed_model()
+
+
+@lru_cache(maxsize=1)
+def _get_vector_store() -> QdrantVectorStore:
+    """Build and cache the vector store wrapper used for retrieval."""
+
+    return QdrantVectorStore(
+        client=_get_qdrant_client(),
+        collection_name=COLLECTION_NAME,
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_index() -> VectorStoreIndex:
+    """Build and cache the vector index used for retrieval."""
+
+    return VectorStoreIndex.from_vector_store(
+        _get_vector_store(),
+        embed_model=_get_embed_model(),
+    )
+
+
 def run_hybrid_search(
     query: str,
     *,
@@ -137,27 +201,10 @@ def run_hybrid_search(
             )
         )
 
-    client = QdrantClient(
-        url=QDRANT_CLUSTER_ENDPOINT,
-        api_key=QDRANT_APIKEY,
-    )
-    vector_store = QdrantVectorStore(
-        client=client,
-        collection_name=COLLECTION_NAME,
-        enable_hybrid=True,
-        fastembed_sparse_model=FASTEMBED_SPARSE_MODEL,
-    )
-
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    index = VectorStoreIndex.from_vector_store(
-        vector_store,
-        storage_context=storage_context,
-    )
-
-    query_engine = index.as_query_engine(
+    query_engine = _get_index().as_query_engine(
         similarity_top_k=top_k,
-        vector_store_query_mode="hybrid",
         node_postprocessors=node_postprocessors,
+        llm=_build_llm(),
     )
 
     response = query_engine.query(query)

@@ -12,7 +12,8 @@ from typing import List
 from qdrant_client import QdrantClient, models
 from tqdm import tqdm
 
-from eval.embedding_and_index_health import IndexEventLedger
+from eval.embedding_and_index_health import EmbeddingSnapshot, IndexEventLedger
+from eval.embedding_and_index_health.metrics import DEFAULT_EMBEDDING_DRIFT_PATH
 
 from .embed import (
     _clear_checkpoint,
@@ -70,6 +71,23 @@ def _log(message: str) -> None:
     """Print a simple ingestion progress message."""
 
     print(f"[qdrant-ingestion] {message}")
+
+
+def _save_embedding_snapshot(vectors: list[list[float]]) -> None:
+    """Persist the latest embedding snapshot so eval can report drift later."""
+
+    snapshot = EmbeddingSnapshot.from_vectors(vectors, label="current")
+    payload = {"current": snapshot.to_dict()}
+    existing = {}
+    if DEFAULT_EMBEDDING_DRIFT_PATH.exists():
+        try:
+            existing_payload = json.loads(DEFAULT_EMBEDDING_DRIFT_PATH.read_text(encoding="utf-8"))
+            if isinstance(existing_payload, dict):
+                existing = {key: value for key, value in existing_payload.items() if key != "current"}
+        except json.JSONDecodeError:
+            existing = {}
+    existing.update(payload)
+    DEFAULT_EMBEDDING_DRIFT_PATH.write_text(json.dumps(existing, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _chunked(items, size: int):
@@ -136,7 +154,7 @@ def _prepare_points(
     deleted_replaced = 0
     processed_embeddings = 0
 
-    for _, embedding, metadata in embeddings:
+    for content, embedding, metadata in embeddings:
         processed_embeddings += 1
         source_key = metadata.get("source_key")
         source_hash = metadata.get("source_hash")
@@ -174,7 +192,10 @@ def _prepare_points(
             models.PointStruct(
                 id=stable_id,
                 vector=embedding,
-                payload=metadata,
+                payload={
+                    **metadata,
+                    "text": content,
+                },
             )
         )
 
@@ -218,7 +239,10 @@ def _load_state() -> dict:
 
     if not INGESTION_STATE_PATH.exists():
         return {"source_hashes": {}}
-    return json.loads(INGESTION_STATE_PATH.read_text(encoding="utf-8"))
+    try:
+        return json.loads(INGESTION_STATE_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"source_hashes": {}}
 
 
 def _save_state(state: dict) -> None:
@@ -286,6 +310,7 @@ def main() -> None:
 
         checkpoint = _load_checkpoint()
         checkpoint_embeddings = get_checkpoint_embeddings(checkpoint)
+        embedding_vectors = [vector for _, vector, _ in checkpoint_embeddings]
         next_task_index = int(checkpoint.get("next_task_index", 0) or 0)
         collection_ready = False
         batch_number = 0
@@ -333,6 +358,7 @@ def main() -> None:
 
         for batch_next_index, batch_records in iter_document_embedding_batches(checkpoint):
             streamed_embeddings += len(batch_records)
+            embedding_vectors.extend(vector for _, vector, _ in batch_records)
             points, stats = _prepare_points(
                 batch_records,
                 current_keys=current_keys,
@@ -380,6 +406,8 @@ def main() -> None:
         _log("Saving ingestion state")
         state["source_hashes"] = indexed_hashes
         _save_state(state)
+        if embedding_vectors:
+            _save_embedding_snapshot(embedding_vectors)
         _clear_checkpoint()
         _log(
             "Summary: "
