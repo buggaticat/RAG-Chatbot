@@ -25,9 +25,10 @@ def _install_retrieval_stubs(monkeypatch, documents=None):
 
     class FakeIndex:
         @classmethod
-        def from_vector_store(cls, vector_store, storage_context=None):
+        def from_vector_store(cls, vector_store, embed_model=None, **kwargs):
             calls["vector_store"] = vector_store
-            calls["storage_context"] = storage_context
+            calls["embed_model"] = embed_model
+            calls["from_vector_store_kwargs"] = kwargs
             return cls()
 
         def as_query_engine(self, **kwargs):
@@ -52,12 +53,25 @@ def _install_retrieval_stubs(monkeypatch, documents=None):
     fake_qdrant_module = types.ModuleType("llama_index.vector_stores.qdrant")
     fake_qdrant_module.QdrantVectorStore = FakeQdrantVectorStore
 
+    fake_embeddings_module = types.ModuleType("llama_index.embeddings")
+    fake_openai_module = types.ModuleType("llama_index.embeddings.openai")
+
+    class FakeOpenAIEmbedding:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            self.model = kwargs.get("model", "text-embedding-3-large")
+
+    fake_openai_module.OpenAIEmbedding = FakeOpenAIEmbedding
+
     fake_qdrant_client = types.ModuleType("qdrant_client")
     fake_qdrant_client.QdrantClient = lambda **kwargs: types.SimpleNamespace(**kwargs)
 
     monkeypatch.setitem(sys.modules, "llama_index", types.ModuleType("llama_index"))
     monkeypatch.setitem(sys.modules, "llama_index.core", fake_llama_core)
     monkeypatch.setitem(sys.modules, "llama_index.core.postprocessor", fake_postprocessor_module)
+    monkeypatch.setitem(sys.modules, "llama_index.embeddings", fake_embeddings_module)
+    monkeypatch.setitem(sys.modules, "llama_index.embeddings.openai", fake_openai_module)
     monkeypatch.setitem(sys.modules, "llama_index.vector_stores", types.ModuleType("llama_index.vector_stores"))
     monkeypatch.setitem(sys.modules, "llama_index.vector_stores.qdrant", fake_qdrant_module)
     monkeypatch.setitem(sys.modules, "qdrant_client", fake_qdrant_client)
@@ -161,8 +175,11 @@ def test_run_hybrid_search_filters_before_indexing(monkeypatch):
     )
 
     assert calls["vector_store_kwargs"]["collection_name"] == hybrid_search.COLLECTION_NAME
+    assert "enable_hybrid" not in calls["vector_store_kwargs"]
+    assert "fastembed_sparse_model" not in calls["vector_store_kwargs"]
+    assert calls["embed_model"].model == hybrid_search.EMBEDDING_MODEL_NAME
     assert calls["query_engine_kwargs"]["similarity_top_k"] == 3
-    assert calls["query_engine_kwargs"]["vector_store_query_mode"] == "hybrid"
+    assert "vector_store_query_mode" not in calls["query_engine_kwargs"]
     assert calls["queried"] == "find alice"
     assert response.answer == "response for find alice"
 
@@ -179,7 +196,6 @@ def test_run_hybrid_search_adds_cross_encoder_reranker_when_requested(monkeypatc
     )
 
     assert calls["query_engine_kwargs"]["similarity_top_k"] == 7
-    assert calls["query_engine_kwargs"]["vector_store_query_mode"] == "hybrid"
     assert len(calls["query_engine_kwargs"]["node_postprocessors"]) == 1
     assert calls["reranker_kwargs"] == {
         "model": "cross-encoder/ms-marco-MiniLM-L-12-v2",

@@ -152,3 +152,48 @@ def test_build_all_documents_paginates_s3_results(monkeypatch):
     assert [doc.text for doc in documents] == ["A", "B"]
     assert documents[0].metadata["source_key"] == "paper-1.json"
     assert documents[0].metadata["source_hash"]
+
+
+def test_iter_all_documents_streams_documents_from_s3(monkeypatch):
+    build_documents, fake_client = _import_build_documents(monkeypatch)
+
+    pages = [
+        {
+            "Contents": [{"Key": "paper-1.json"}],
+            "IsTruncated": False,
+        }
+    ]
+    payloads = {
+        "paper-1.json": json.dumps(
+            {
+                "id": "paper-1",
+                "abstract": "A",
+                "sections": [
+                    {"section_id": 1, "text": "B", "tables": {}, "images": {}},
+                ],
+            }
+        ).encode("utf-8")
+    }
+
+    fake_client.list_objects_v2 = lambda **kwargs: pages.pop(0)
+    fake_client.get_object = lambda Bucket, Key: {"Body": BytesIO(payloads[Key])}
+
+    seen = []
+
+    def build_stub(data):
+        doc = types.SimpleNamespace(text=data.get("abstract", ""), metadata={})
+        section_doc = types.SimpleNamespace(text=data["sections"][0]["text"], metadata={})
+        seen.append("called")
+        return [doc, section_doc]
+
+    monkeypatch.setattr(build_documents, "_build_documents_from_paper", build_stub)
+
+    iterator = build_documents.iter_all_documents()
+    first = next(iterator)
+    second = next(iterator)
+
+    assert first.text == "A"
+    assert second.text == "B"
+    assert first.metadata["source_key"] == "paper-1.json"
+    assert second.metadata["source_hash"]
+    assert seen == ["called"]
